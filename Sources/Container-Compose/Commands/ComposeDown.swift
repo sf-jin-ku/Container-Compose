@@ -48,6 +48,9 @@ public struct ComposeDown: AsyncParsableCommand {
     @Option(name: .customLong("profile"), parsing: .singleValue, help: "Enable a Compose profile")
     var profiles: [String] = []
 
+    @Flag(name: .customLong("remove-orphans"), help: "Accepted for Docker Compose compatibility")
+    var removeOrphans = false
+
     private var composeFiles: ComposeFileSelection {
         ComposeFileSelection.resolve(explicitFilenames: composeFilenames, cwd: cwd, fileManager: fileManager)
     }
@@ -72,13 +75,14 @@ public struct ComposeDown: AsyncParsableCommand {
             print("Info: No 'name' field found in docker-compose.yml. Using directory name as project name: \(projectName ?? "")")
         }
 
+        let activeProfiles = activeComposeProfiles(cliProfiles: profiles)
         let services = try ComposeServiceSelection.servicesToStopForDown(
             from: dockerCompose,
             requestedServices: self.services,
-            activeProfiles: activeComposeProfiles(cliProfiles: profiles)
+            activeProfiles: activeProfiles
         )
 
-        try await stopOldStuff(services, remove: false)
+        try await stopOldStuff(Array(services.reversed()), remove: true)
     }
 
     private func stopOldStuff(_ services: [(serviceName: String, service: Service)], remove: Bool) async throws {
@@ -89,7 +93,7 @@ public struct ComposeDown: AsyncParsableCommand {
             if let explicitContainerName = service.container_name {
                 containerName = explicitContainerName
             } else {
-                containerName = "\(projectName)-\(serviceName)"
+                containerName = composeGeneratedContainerName(projectName: projectName, serviceName: serviceName)
             }
 
             print("Stopping container: \(containerName)")
@@ -113,6 +117,7 @@ public struct ComposeDown: AsyncParsableCommand {
                     print("Successfully removed container: \(containerName)")
                 } catch {
                     print("Error Removing Container: \(error)")
+                    throw error
                 }
             }
         }

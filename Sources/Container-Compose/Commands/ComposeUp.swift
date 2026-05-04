@@ -29,6 +29,12 @@ import ContainerizationExtras
 import Foundation
 @preconcurrency import Rainbow
 
+enum ComposeUpPullPolicy: String, ExpressibleByArgument {
+    case always
+    case missing
+    case never
+}
+
 public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
     public init() {}
 
@@ -50,6 +56,15 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
 
     @Option(name: .customLong("profile"), parsing: .singleValue, help: "Enable a Compose profile")
     var profiles: [String] = []
+
+    @Flag(name: .customLong("remove-orphans"), help: "Accepted for Docker Compose compatibility")
+    var removeOrphans: Bool = false
+
+    @Flag(name: .customLong("no-build"), help: "Do not build images, even if a service defines a build section")
+    var noBuild: Bool = false
+
+    @Option(name: .customLong("pull"), help: "Pull policy: missing, always, or never")
+    var pullPolicy: ComposeUpPullPolicy = .missing
 
     @Flag(name: .customLong("force-recreate"), help: "Accepted for Docker Compose compatibility")
     var forceRecreate: Bool = false
@@ -409,12 +424,12 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
         var runCommandArgs: [String] = []
 
         // Handle 'build' configuration
-        if let buildConfig = service.build {
+        if let buildConfig = service.build, !noBuild {
             imageToRun = try await buildService(buildConfig, for: service, serviceName: serviceName)
         } else if let img = service.image {
             // Use specified image if no build config
             // Pull image if necessary
-            try await pullImage(img, platform: service.platform)
+            try await pullImage(img, platform: service.platform, policy: pullPolicy)
             imageToRun = img
         } else {
             // Should not happen due to Service init validation, but as a fallback
@@ -426,11 +441,11 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
             runCommandArgs.append(contentsOf: ["--platform", "\(platform)"])
         }
 
-        // Handle 'deploy' configuration (note that this tool doesn't fully support it)
+        // Handle 'deploy' configuration (note that this tool only supports the local runtime subset)
         if service.deploy != nil {
             print("Note: The 'deploy' configuration for service '\(serviceName)' was parsed successfully.")
             print(
-                "However, this 'container-compose' tool does not currently support 'deploy' functionality (e.g., replicas, resources, update strategies) as it is primarily for orchestration platforms like Docker Swarm or Kubernetes, not direct 'container run' commands."
+                "This tool maps deploy.resources.limits.cpus and deploy.resources.limits.memory to Apple container runtime flags; other deploy features such as replicas, placement, and update strategies are ignored."
             )
             print("The service will be run as a single container based on other configurations.")
         }
@@ -451,6 +466,12 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
         }
         runCommandArgs.append("--name")
         runCommandArgs.append(containerName)
+        runCommandArgs.append(contentsOf: composeProjectLabelArguments(
+            projectName: projectName ?? deriveProjectName(cwd: cwd),
+            serviceName: serviceName,
+            workingDirectory: composeDirectory,
+            composeFilePaths: composeFiles.paths
+        ))
 
         // REMOVED: Restart policy is not supported by `container run`
         // if let restart = service.restart {
@@ -676,9 +697,13 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
         return false
     }
 
-    private func pullImage(_ imageName: String, platform: String?) async throws {
+    private func pullImage(_ imageName: String, platform: String?, policy: ComposeUpPullPolicy = .missing) async throws {
+        guard policy != .never else {
+            return
+        }
         let imageList = try await ClientImage.list()
-        guard !imageList.contains(where: { $0.description.reference.components(separatedBy: "/").last == imageName }) else {
+        guard policy == .always ||
+              !imageList.contains(where: { imageReferenceMatches(localReference: $0.description.reference, requestedReference: imageName) }) else {
             return
         }
 
@@ -903,7 +928,7 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
         if let explicitContainerName = service.container_name {
             return explicitContainerName
         }
-        return "\(projectName ?? deriveProjectName(cwd: cwd))-\(serviceName)"
+        return composeGeneratedContainerName(projectName: projectName ?? deriveProjectName(cwd: cwd), serviceName: serviceName)
     }
 }
 

@@ -35,9 +35,12 @@ struct ComposeDownTests {
         ])
         try await composeUp.run()
 
+        let wordpressID = composeGeneratedContainerName(projectName: project.name, serviceName: "wordpress")
+        let dbID = composeGeneratedContainerName(projectName: project.name, serviceName: "db")
+        let expectedIDs: Set<String> = [wordpressID, dbID]
         var containers = try await ContainerClient().list()
             .filter({
-                $0.configuration.id.contains(project.name)
+                expectedIDs.contains($0.configuration.id)
             })
 
         #expect(
@@ -51,14 +54,12 @@ struct ComposeDownTests {
 
         containers = try await ContainerClient().list()
             .filter({
-                $0.configuration.id.contains(project.name)
+                expectedIDs.contains($0.configuration.id)
             })
 
         #expect(
-            containers.count == 2,
-            "Expected 2 containers for \(project.name), found \(containers.count)")
-
-        #expect(containers.filter({ $0.status == .stopped}).count == 2, "Expected 2 stopped containers for \(project.name), found \(containers.filter({ $0.status == .stopped }).count)")
+            containers.isEmpty,
+            "Expected 0 containers for \(project.name) after down, found \(containers.count)")
     }
 
     @Test("What goes up must come down - container_name")
@@ -97,12 +98,8 @@ struct ComposeDownTests {
             })
 
         #expect(
-            containers.count == 1,
-            "Expected 1 container with the name \(containerName), found \(containers.count)")
-        #expect(
-            containers.filter({ $0.status == .stopped }).count == 1,
-            "Expected container \(containerName) to be stopped, found status: \(containers.map(\.status))"
-        )
+            containers.isEmpty,
+            "Expected 0 containers with the name \(containerName) after down, found \(containers.count)")
     }
 
     enum Errors: Error {

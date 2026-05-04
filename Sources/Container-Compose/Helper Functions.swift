@@ -93,6 +93,20 @@ public func activeComposeProfiles(cliProfiles: [String]) -> [String] {
     return (cliProfiles + environmentProfiles).filter { seen.insert($0).inserted }
 }
 
+public func composeProjectLabelArguments(
+    projectName: String,
+    serviceName: String,
+    workingDirectory: String,
+    composeFilePaths: [String]
+) -> [String] {
+    [
+        "com.docker.compose.project=\(projectName)",
+        "com.docker.compose.service=\(serviceName)",
+        "com.docker.compose.project.working_dir=\(workingDirectory)",
+        "com.docker.compose.project.config_files=\(composeFilePaths.joined(separator: ","))",
+    ].flatMap { ["--label", $0] }
+}
+
 public func composeShellSplit(_ input: String) -> [String] {
     enum Quote {
         case single
@@ -332,6 +346,44 @@ public func sanitizeComposeProjectName(_ name: String) -> String {
         character.isASCII && (character.isLetter || character.isNumber || character == "-" || character == "_") ? character : "_"
     })
     return sanitized.isEmpty ? "default" : sanitized
+}
+
+public let appleContainerNameMaxLength = 64
+
+public func composeGeneratedContainerName(projectName: String, serviceName: String) -> String {
+    let rawName = "\(projectName)-\(serviceName)-1"
+    guard rawName.count > appleContainerNameMaxLength else { return rawName }
+
+    let hash = fnv1a64(rawName)
+    let suffix = "-" + String(hash, radix: 16, uppercase: false)
+    let prefixLength = max(1, appleContainerNameMaxLength - suffix.count)
+    return String(rawName.prefix(prefixLength)) + suffix
+}
+
+private func fnv1a64(_ value: String) -> UInt64 {
+    var hash: UInt64 = 0xcbf29ce484222325
+    for byte in value.utf8 {
+        hash ^= UInt64(byte)
+        hash &*= 0x100000001b3
+    }
+    return hash
+}
+
+func imageReferenceMatches(localReference: String, requestedReference: String) -> Bool {
+    if localReference == requestedReference {
+        return true
+    }
+
+    let localParts = localReference.split(separator: "/").map(String.init)
+    let requestedParts = requestedReference.split(separator: "/").map(String.init)
+    guard let localLeaf = localParts.last, let requestedLeaf = requestedParts.last else {
+        return false
+    }
+
+    if requestedParts.count == 1 {
+        return localLeaf == requestedLeaf
+    }
+    return localReference.hasSuffix(requestedReference)
 }
 
 /// Converts Docker Compose port specification into a container run -p format.
