@@ -46,6 +46,7 @@ public enum ComposeError: Error, LocalizedError {
     case dependencyNotHealthy(String)
     case dependencyNotCompleted(String)
     case unsupportedDependencyCondition(String)
+    case invalidVolumeName(String)
     case missingEnvFile(String)
 
     public var errorDescription: String? {
@@ -67,6 +68,8 @@ public enum ComposeError: Error, LocalizedError {
         case .dependencyNotCompleted(let message):
             return message
         case .unsupportedDependencyCondition(let message):
+            return message
+        case .invalidVolumeName(let message):
             return message
         case .missingEnvFile(let message):
             return message

@@ -104,7 +104,8 @@ struct ComposeLifecycleParsingTests {
         #expect(stop.timeout == 2)
         #expect(stop.services == ["app"])
 
-        let down = try ComposeDown.parse(["--remove-orphans", "app"])
+        let down = try ComposeDown.parse(["-v", "--remove-orphans", "app"])
+        #expect(down.removeVolumes)
         #expect(down.removeOrphans)
         #expect(down.services == ["app"])
 

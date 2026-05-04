@@ -48,6 +48,9 @@ public struct ComposeDown: AsyncParsableCommand {
     @Option(name: .customLong("profile"), parsing: .singleValue, help: "Enable a Compose profile")
     var profiles: [String] = []
 
+    @Flag(name: [.customShort("v"), .customLong("volumes")], help: "Remove project-owned named volumes")
+    var removeVolumes = false
+
     @Flag(name: .customLong("remove-orphans"), help: "Accepted for Docker Compose compatibility")
     var removeOrphans = false
 
@@ -83,6 +86,9 @@ public struct ComposeDown: AsyncParsableCommand {
         )
 
         try await stopOldStuff(Array(services.reversed()), remove: true)
+        if removeVolumes {
+            try await removeProjectVolumes(from: dockerCompose, services: services, environmentVariables: environmentVariables)
+        }
     }
 
     private func stopOldStuff(_ services: [(serviceName: String, service: Service)], remove: Bool) async throws {
@@ -119,6 +125,32 @@ public struct ComposeDown: AsyncParsableCommand {
                     print("Error Removing Container: \(error)")
                     throw error
                 }
+            }
+        }
+    }
+
+    private func removeProjectVolumes(
+        from dockerCompose: DockerCompose,
+        services: [(serviceName: String, service: Service)],
+        environmentVariables: [String: String]
+    ) async throws {
+        guard let projectName else { return }
+        let volumeNames = try composeVolumeDeleteCandidates(
+            projectName: projectName,
+            topLevelVolumes: dockerCompose.volumes,
+            services: services,
+            environmentVariables: environmentVariables
+        )
+        for volumeName in volumeNames {
+            do {
+                try await ClientVolume.delete(name: volumeName)
+                print("Successfully removed volume: \(volumeName)")
+            } catch {
+                if composeVolumeErrorIsNotFound(error) {
+                    print("Warning: Volume '\(volumeName)' not found, skipping.")
+                    continue
+                }
+                throw error
             }
         }
     }

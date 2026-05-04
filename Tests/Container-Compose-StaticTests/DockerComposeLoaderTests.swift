@@ -299,6 +299,11 @@ struct DockerComposeLoaderTests {
         let search = try #require(compose.services["search"] ?? nil)
 
         #expect(search.volumes == ["/tmp/container-compose-demo/search-data:/var/lib/search"])
+        #expect(composeReferencedTopLevelVolumeKeys(
+            topLevelVolumes: compose.volumes,
+            services: [("search", search)],
+            environmentVariables: environment
+        ).isEmpty)
     }
 
     @Test("Compose override tag replaces service volume sequence")

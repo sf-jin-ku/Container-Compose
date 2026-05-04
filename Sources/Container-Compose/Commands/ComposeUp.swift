@@ -164,13 +164,16 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
             print("--- Networks Processed ---\n")
         }
 
-        // Process top-level volumes
-        // This creates named volumes defined in the docker-compose.yml
-        if let volumes = dockerCompose.volumes {
+        // Process named volumes referenced by selected services.
+        let volumeCandidates = composeVolumeCreateCandidates(
+            topLevelVolumes: dockerCompose.volumes,
+            services: services,
+            environmentVariables: environmentVariables
+        )
+        if !volumeCandidates.isEmpty {
             print("\n--- Processing Volumes ---")
-            for (volumeName, volumeConfig) in volumes {
-                guard let volumeConfig else { continue }
-                await createVolumeHardLink(name: volumeName, config: volumeConfig)
+            for candidate in volumeCandidates {
+                try await createComposeVolume(name: candidate.volumeKey, config: candidate.volume)
             }
             print("--- Volumes Processed ---\n")
         }
@@ -335,17 +338,36 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
         }
     }
 
-    private func createVolumeHardLink(name volumeName: String, config volumeConfig: Volume) async {
+    private func createComposeVolume(name volumeName: String, config volumeConfig: Volume) async throws {
         guard let projectName else { return }
-        let actualVolumeName = volumeConfig.name ?? volumeName  // Use explicit name or key as name
+        let actualVolumeName = composeVolumeName(projectName: projectName, volumeKey: volumeName, volume: volumeConfig)
+        try validateComposeVolumeName(actualVolumeName)
 
-        let volumeUrl = URL.homeDirectory.appending(path: ".containers/Volumes/\(projectName)/\(actualVolumeName)")
-        let volumePath = volumeUrl.path(percentEncoded: false)
+        if composeVolumeIsExternal(volumeConfig) {
+            print("Info: Volume '\(volumeName)' is declared as external. Using existing volume '\(actualVolumeName)'.")
+            do {
+                _ = try await ClientVolume.inspect(actualVolumeName)
+            } catch {
+                throw ComposeError.dependencyNotReady("external volume '\(actualVolumeName)' not found")
+            }
+            return
+        }
 
-        print(
-            "Warning: Volume source '\(actualVolumeName)' appears to be a named volume reference. The 'container' tool does not support named volume references in 'container run -v' command. Linking to \(volumePath) instead."
-        )
-        try? fileManager.createDirectory(atPath: volumePath, withIntermediateDirectories: true)
+        do {
+            _ = try await ClientVolume.create(
+                name: actualVolumeName,
+                driver: volumeConfig.driver ?? "local",
+                driverOpts: volumeConfig.driver_opts ?? [:],
+                labels: volumeConfig.labels ?? [:]
+            )
+            print("Volume '\(volumeName)' created as '\(actualVolumeName)'")
+        } catch {
+            if composeVolumeErrorIsAlreadyExists(error) {
+                print("Volume '\(actualVolumeName)' already exists")
+                return
+            }
+            throw error
+        }
     }
 
     private func setupNetwork(name networkName: String, config networkConfig: Network?) async throws {
@@ -488,7 +510,7 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
         // Add volume mounts
         if let volumes = service.volumes {
             for volume in volumes {
-                let args = try await configVolume(volume)
+                let args = try await configVolume(volume, from: dockerCompose)
                 runCommandArgs.append(contentsOf: args)
             }
         }
@@ -780,71 +802,20 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
         return imageToRun
     }
 
-    private func configVolume(_ volume: String) async throws -> [String] {
-        let resolvedVolume = resolveVariable(volume, with: environmentVariables)
-
-        var runCommandArgs: [String] = []
-
-        // Parse the volume string: destination[:mode]
-        let components = resolvedVolume.split(separator: ":", maxSplits: 2).map(String.init)
-
-        guard components.count >= 2 else {
-            print("Warning: Volume entry '\(resolvedVolume)' has an invalid format (expected 'source:destination'). Skipping.")
+    private func configVolume(_ volume: String, from dockerCompose: DockerCompose) async throws -> [String] {
+        guard let projectName else { return [] }
+        guard let mountArgument = try composeVolumeMountArgument(
+            volume,
+            projectName: projectName,
+            topLevelVolumes: dockerCompose.volumes,
+            environmentVariables: environmentVariables,
+            composeDirectory: composeDirectory,
+            fileManager: fileManager
+        ) else {
+            print("Warning: Volume entry '\(resolveVariable(volume, with: environmentVariables))' has an invalid format. Skipping.")
             return []
         }
-
-        let source = components[0]
-        let destination = components[1]
-
-        // Check if the source looks like a host path (contains '/' or starts with '.')
-        // This heuristic helps distinguish bind mounts from named volume references.
-        if source.contains("/") || source.starts(with: ".") || source.starts(with: "..") {
-            // This is likely a bind mount (local path to container path)
-            var isDirectory: ObjCBool = false
-            // Ensure the path is absolute or relative to the current directory for FileManager
-            let fullHostPath = (source.starts(with: "/") || source.starts(with: "~")) ? source : (cwd + "/" + source)
-
-            if fileManager.fileExists(atPath: fullHostPath, isDirectory: &isDirectory) {
-                if isDirectory.boolValue {
-                    // Host path exists and is a directory, add the volume
-                    runCommandArgs.append("-v")
-                    // Reconstruct the volume string without mode, ensuring it's source:destination
-                    runCommandArgs.append("\(source):\(destination)")  // Use original source for command argument
-                } else {
-                    // Host path exists but is a file
-                    print("Warning: Volume mount source '\(source)' is a file. The 'container' tool does not support direct file mounts. Skipping this volume.")
-                }
-            } else {
-                // Host path does not exist, assume it's meant to be a directory and try to create it.
-                do {
-                    try fileManager.createDirectory(atPath: fullHostPath, withIntermediateDirectories: true, attributes: nil)
-                    print("Info: Created missing host directory for volume: \(fullHostPath)")
-                    runCommandArgs.append("-v")
-                    runCommandArgs.append("\(source):\(destination)")  // Use original source for command argument
-                } catch {
-                    print("Error: Could not create host directory '\(fullHostPath)' for volume '\(resolvedVolume)': \(error.localizedDescription). Skipping this volume.")
-                }
-            }
-        } else {
-            guard let projectName else { return [] }
-            let volumeUrl = URL.homeDirectory.appending(path: ".containers/Volumes/\(projectName)/\(source)")
-            let volumePath = volumeUrl.path(percentEncoded: false)
-
-            let destinationUrl = URL(fileURLWithPath: destination).deletingLastPathComponent()
-            let destinationPath = destinationUrl.path(percentEncoded: false)
-
-            print(
-                "Warning: Volume source '\(source)' appears to be a named volume reference. The 'container' tool does not support named volume references in 'container run -v' command. Linking to \(volumePath) instead."
-            )
-            try fileManager.createDirectory(atPath: volumePath, withIntermediateDirectories: true)
-
-            // Host path exists and is a directory, add the volume
-            runCommandArgs.append("-v")
-            // Reconstruct the volume string without mode, ensuring it's source:destination
-            runCommandArgs.append("\(volumePath):\(destinationPath)")  // Use original source for command argument
-        }
-
-        return runCommandArgs
+        return ["-v", mountArgument]
     }
 
     private func waitForDependencies(
