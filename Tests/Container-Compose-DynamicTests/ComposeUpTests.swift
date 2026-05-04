@@ -322,6 +322,93 @@ struct ComposeUpTests {
         
         try? await stopInstance(location: project.base)
     }
+
+    @Test("Test service_healthy dependency waits for healthcheck")
+    func testServiceHealthyDependencyWaitsForHealthcheck() async throws {
+        let yaml = """
+            services:
+              ready:
+                image: alpine:latest
+                command:
+                  - sh
+                  - -c
+                  - touch /tmp/ready && sleep 60
+                healthcheck:
+                  test: ["CMD", "test", "-f", "/tmp/ready"]
+                  interval: 1s
+                  retries: 5
+              app:
+                image: alpine:latest
+                command:
+                  - sh
+                  - -c
+                  - sleep 60
+                depends_on:
+                  ready:
+                    condition: service_healthy
+            """
+
+        let project = try DockerComposeYamlFiles.copyYamlToTemporaryLocation(yaml: yaml)
+
+        var composeUp = try ComposeUp.parse(["-d", "--cwd", project.base.path(percentEncoded: false)])
+        try await composeUp.run()
+
+        let readyID = "\(project.name)-ready"
+        let appID = "\(project.name)-app"
+        let expectedIDs: Set<String> = [readyID, appID]
+        let containers = try await ContainerClient().list()
+            .filter { expectedIDs.contains($0.configuration.id) }
+
+        guard let readyContainer = containers.first(where: { $0.configuration.id == readyID }),
+              let appContainer = containers.first(where: { $0.configuration.id == appID })
+        else {
+            throw Errors.containerNotFound
+        }
+
+        #expect(readyContainer.status == .running)
+        #expect(appContainer.status == .running)
+
+        try? await stopInstance(location: project.base)
+    }
+
+    @Test("Test service_completed_successfully dependency waits for exit")
+    func testServiceCompletedSuccessfullyDependencyWaitsForExit() async throws {
+        let yaml = """
+            services:
+              migrate:
+                image: alpine:latest
+                command:
+                  - sh
+                  - -c
+                  - echo migrated
+              app:
+                image: alpine:latest
+                command:
+                  - sh
+                  - -c
+                  - sleep 60
+                depends_on:
+                  migrate:
+                    condition: service_completed_successfully
+            """
+
+        let project = try DockerComposeYamlFiles.copyYamlToTemporaryLocation(yaml: yaml)
+
+        var composeUp = try ComposeUp.parse(["-d", "--cwd", project.base.path(percentEncoded: false)])
+        try await composeUp.run()
+
+        let appID = "\(project.name)-app"
+        let containers = try await ContainerClient().list()
+            .filter { $0.configuration.id == appID }
+
+        guard let appContainer = containers.first(where: { $0.configuration.id == appID }) else {
+            throw Errors.containerNotFound
+        }
+
+        #expect(appContainer.status == .running)
+
+        try? await stopInstance(location: project.base)
+    }
     
     enum Errors: Error {
         case containerNotFound

@@ -41,6 +41,11 @@ public enum ComposeError: Error, LocalizedError {
     case invalidProjectName
     case serviceNotFound(String)
     case unsupportedRuntimeOption(String)
+    case unsupportedHealthcheck(String)
+    case dependencyNotReady(String)
+    case dependencyNotHealthy(String)
+    case dependencyNotCompleted(String)
+    case unsupportedDependencyCondition(String)
     case missingEnvFile(String)
 
     public var errorDescription: String? {
@@ -52,6 +57,16 @@ public enum ComposeError: Error, LocalizedError {
         case .serviceNotFound(let name):
             return "service '\(name)' not found"
         case .unsupportedRuntimeOption(let message):
+            return message
+        case .unsupportedHealthcheck(let message):
+            return message
+        case .dependencyNotReady(let message):
+            return message
+        case .dependencyNotHealthy(let message):
+            return message
+        case .dependencyNotCompleted(let message):
+            return message
+        case .unsupportedDependencyCondition(let message):
             return message
         case .missingEnvFile(let message):
             return message

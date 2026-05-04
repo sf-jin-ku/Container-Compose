@@ -14,7 +14,19 @@
 // limitations under the License.
 //===----------------------------------------------------------------------===//
 
+enum ComposeServiceReadinessRequirement: Equatable {
+    case running
+    case healthy
+    case completedSuccessfully
+}
+
 struct ComposeServiceSelection {
+    private static let supportedDependencyConditions: Set<String> = [
+        "service_started",
+        "service_healthy",
+        "service_completed_successfully",
+    ]
+
     static func configuredServices(from dockerCompose: DockerCompose) -> [(serviceName: String, service: Service)] {
         dockerCompose.services.compactMap { serviceName, service in
             guard let service else { return nil }
@@ -28,14 +40,30 @@ struct ComposeServiceSelection {
         activeProfiles: [String],
         includeDependencies: Bool = true
     ) throws -> [(serviceName: String, service: Service)] {
-        let services = try Service.topoSortConfiguredServices(configuredServices(from: dockerCompose))
-        try validateRequestedServicesExist(requestedServices, in: services)
+        let allServices = try Service.topoSortConfiguredServices(configuredServices(from: dockerCompose))
+        let availableServiceNames = Set(allServices.map(\.serviceName))
+        var services = allServices
+        try validateRequestedServicesExist(requestedServices, in: allServices)
         if !requestedServices.isEmpty {
-            return includeDependencies
-                ? filterByRequestedServices(services, requestedServices: requestedServices)
-                : filterByExactRequestedServices(services, requestedServices: requestedServices)
+            services = includeDependencies
+                ? filterByRequestedServices(allServices, requestedServices: requestedServices)
+                : filterByExactRequestedServices(allServices, requestedServices: requestedServices)
+        } else {
+            let profileEnabledServices = filterByProfiles(allServices, activeProfiles: activeProfiles)
+            if includeDependencies {
+                let profileEnabledServiceNames = profileEnabledServices.map(\.serviceName)
+                services = profileEnabledServiceNames.isEmpty
+                    ? []
+                    : filterByRequestedServices(allServices, requestedServices: profileEnabledServiceNames)
+            } else {
+                services = profileEnabledServices
+            }
         }
-        return filterByProfiles(services, activeProfiles: activeProfiles)
+        if includeDependencies {
+            try validateRequiredDependenciesExist(in: services, availableServiceNames: availableServiceNames)
+            try validateDependencyConditions(in: services)
+        }
+        return services
     }
 
     static func servicesToStopForDown(
@@ -43,12 +71,13 @@ struct ComposeServiceSelection {
         requestedServices: [String],
         activeProfiles: [String]
     ) throws -> [(serviceName: String, service: Service)] {
-        let services = try Service.topoSortConfiguredServices(configuredServices(from: dockerCompose))
+        var services = try Service.topoSortConfiguredServices(configuredServices(from: dockerCompose))
         try validateRequestedServicesExist(requestedServices, in: services)
         if !requestedServices.isEmpty {
             return filterByExactRequestedServices(services, requestedServices: requestedServices)
         }
-        return filterByProfiles(services, activeProfiles: activeProfiles)
+        services = filterByProfiles(services, activeProfiles: activeProfiles)
+        return services
     }
 
     static func validateRequestedServicesExist(
@@ -58,7 +87,7 @@ struct ComposeServiceSelection {
         guard !requestedServices.isEmpty else { return }
         let serviceNames = Set(services.map(\.serviceName))
         for requestedService in requestedServices where !serviceNames.contains(requestedService) {
-            throw ComposeError.serviceNotFound(requestedService)
+            throw ComposeError.dependencyNotReady("service '\(requestedService)' not found")
         }
     }
 
@@ -107,5 +136,89 @@ struct ComposeServiceSelection {
         return services.filter { serviceName, _ in
             requestedServices.contains(serviceName)
         }
+    }
+
+    static func servicesRequiredToCompleteSuccessfully(in dockerCompose: DockerCompose) -> Set<String> {
+        Set(configuredServices(from: dockerCompose).flatMap { _, service in
+            (service.dependencyConfigurations ?? [:]).compactMap { dependencyName, dependency in
+                dependency.condition == "service_completed_successfully" ? dependencyName : nil
+            }
+        })
+    }
+
+    static func validateRequiredDependenciesExist(
+        in services: [(serviceName: String, service: Service)],
+        availableServiceNames: Set<String>
+    ) throws {
+        for (serviceName, service) in services {
+            for dependencyName in service.depends_on ?? [] {
+                let required = service.dependencyConfigurations?[dependencyName]?.required ?? true
+                guard required, !availableServiceNames.contains(dependencyName) else { continue }
+                throw ComposeError.dependencyNotReady(
+                    "service \(serviceName) depends on missing required service \(dependencyName)"
+                )
+            }
+        }
+    }
+
+    static func validateDependencyConditions(
+        in services: [(serviceName: String, service: Service)]
+    ) throws {
+        for (serviceName, service) in services {
+            for (_, dependency) in service.dependencyConfigurations ?? [:] {
+                let condition = dependency.condition ?? "service_started"
+                guard supportedDependencyConditions.contains(condition) else {
+                    throw ComposeError.unsupportedDependencyCondition(
+                        "service '\(serviceName)' uses unsupported depends_on condition '\(condition)'"
+                    )
+                }
+            }
+        }
+    }
+
+    static func servicesToRecreateForUp(
+        selectedServices: [(serviceName: String, service: Service)],
+        requestedServices: [String],
+        forceRecreate: Bool = false
+    ) -> [(serviceName: String, service: Service)] {
+        if forceRecreate { return selectedServices }
+        guard !requestedServices.isEmpty else { return selectedServices }
+        let requested = Set(requestedServices)
+        return selectedServices.filter { serviceName, _ in requested.contains(serviceName) }
+    }
+
+    static func serviceIsExplicitlyRequested(_ serviceName: String, requestedServices: [String]) -> Bool {
+        requestedServices.isEmpty || requestedServices.contains(serviceName)
+    }
+
+    static func shouldReuseExistingContainerForUp(
+        serviceName: String,
+        requestedServices: [String],
+        containerIsRunning: Bool
+    ) -> Bool {
+        !serviceIsExplicitlyRequested(serviceName, requestedServices: requestedServices) && containerIsRunning
+    }
+
+    static func shouldRemoveExistingContainerBeforeCompletedUp(
+        waitForSuccessfulCompletion: Bool,
+        containerIsStopped: Bool
+    ) -> Bool {
+        waitForSuccessfulCompletion && containerIsStopped
+    }
+
+    static func readinessRequirementForUp(
+        serviceName: String,
+        service: Service,
+        requestedServices: [String],
+        waitForSuccessfulCompletion: Bool
+    ) -> ComposeServiceReadinessRequirement {
+        if waitForSuccessfulCompletion {
+            return .completedSuccessfully
+        }
+        if serviceIsExplicitlyRequested(serviceName, requestedServices: requestedServices),
+           service.healthcheck != nil {
+            return .healthy
+        }
+        return .running
     }
 }

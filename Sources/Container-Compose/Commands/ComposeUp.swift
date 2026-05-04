@@ -51,6 +51,12 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
     @Option(name: .customLong("profile"), parsing: .singleValue, help: "Enable a Compose profile")
     var profiles: [String] = []
 
+    @Flag(name: .customLong("force-recreate"), help: "Accepted for Docker Compose compatibility")
+    var forceRecreate: Bool = false
+
+    @Flag(name: .customLong("no-deps"), help: "Do not start linked services")
+    var noDeps: Bool = false
+
     private var cwdURL: URL {
         URL(fileURLWithPath: cwd)
     }
@@ -121,11 +127,17 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
         let services = try ComposeServiceSelection.selectedServices(
             from: dockerCompose,
             requestedServices: self.services,
-            activeProfiles: activeComposeProfiles(cliProfiles: profiles)
+            activeProfiles: activeComposeProfiles(cliProfiles: profiles),
+            includeDependencies: !noDeps
+        )
+        let servicesToRecreate = ComposeServiceSelection.servicesToRecreateForUp(
+            selectedServices: services,
+            requestedServices: self.services,
+            forceRecreate: forceRecreate
         )
 
         // Stop Services
-        try await stopOldStuff(services.map({ $0.serviceName }), remove: true)
+        try await stopOldStuff(servicesToRecreate, remove: true)
 
         // Process top-level networks
         // This creates named networks defined in the docker-compose.yml
@@ -152,13 +164,66 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
         print("\n--- Processing Services ---")
 
         print(services.map(\.serviceName))
+        let servicesRequiredToComplete = ComposeServiceSelection.servicesRequiredToCompleteSuccessfully(in: dockerCompose)
+        var completedServices = Set<String>()
         for (serviceName, service) in services {
-            try await configService(service, serviceName: serviceName, from: dockerCompose)
+            let waitForSuccessfulCompletion = servicesRequiredToComplete.contains(serviceName)
+            if ComposeServiceSelection.shouldReuseExistingContainerForUp(
+                serviceName: serviceName,
+                requestedServices: self.services,
+                containerIsRunning: try await existingContainerIsRunning(serviceName: serviceName, service: service)
+            ) {
+                try await updateEnvironmentWithServiceIP(serviceName, containerName: containerName(for: serviceName, service: service))
+                continue
+            }
+            if !noDeps {
+                try await waitForDependencies(of: service, in: dockerCompose, completedServices: completedServices)
+            }
+            if ComposeServiceSelection.shouldRemoveExistingContainerBeforeCompletedUp(
+                waitForSuccessfulCompletion: waitForSuccessfulCompletion,
+                containerIsStopped: try await existingContainerIsStopped(serviceName: serviceName, service: service)
+            ) {
+                try await removeExistingContainer(serviceName: serviceName, service: service)
+            }
+            if try await configService(
+                service,
+                serviceName: serviceName,
+                from: dockerCompose,
+                readinessRequirement: ComposeServiceSelection.readinessRequirementForUp(
+                    serviceName: serviceName,
+                    service: service,
+                    requestedServices: self.services,
+                    waitForSuccessfulCompletion: waitForSuccessfulCompletion
+                )
+            ) {
+                completedServices.insert(serviceName)
+            }
         }
 
         if !detach {
             await waitForever()
         }
+    }
+
+    private func existingContainerIsRunning(serviceName: String, service: Service) async throws -> Bool {
+        let containerName = containerName(for: serviceName, service: service)
+        let container = try? await ContainerClient().get(id: containerName)
+        return container?.status == .running
+    }
+
+    private func existingContainerIsStopped(serviceName: String, service: Service) async throws -> Bool {
+        let containerName = containerName(for: serviceName, service: service)
+        let container = try? await ContainerClient().get(id: containerName)
+        return container?.status == .stopped
+    }
+
+    private func removeExistingContainer(serviceName: String, service: Service) async throws {
+        let containerName = containerName(for: serviceName, service: service)
+        guard let container = try? await ContainerClient().get(id: containerName) else {
+            return
+        }
+        try await ContainerClient().delete(id: container.id)
+        print("Removed stopped one-shot container: \(containerName)")
     }
 
     func waitForever() async -> Never {
@@ -168,11 +233,7 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
         fatalError("unreachable")
     }
 
-    private func getIPForRunningService(_ serviceName: String) async throws -> String? {
-        guard let projectName else { return nil }
-
-        let containerName = "\(projectName)-\(serviceName)"
-
+    private func getIPForRunningContainer(_ containerName: String) async throws -> String? {
         let client = ContainerClient()
         let container = try await client.get(id: containerName)
         let ip = container.networks.compactMap { $0.ipv4Gateway.description }.first
@@ -186,31 +247,47 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
     ///   - timeout: Max seconds to wait before failing.
     ///   - interval: How often to poll (in seconds).
     /// - Returns: `true` if the container reached "running" state within the timeout.
-    private func waitUntilServiceIsRunning(_ serviceName: String, timeout: TimeInterval = 30, interval: TimeInterval = 0.5) async throws {
-        guard let projectName else { return }
-        let containerName = "\(projectName)-\(serviceName)"
-
+    private func waitUntilContainerIsRunning(
+        _ containerName: String,
+        timeout: TimeInterval = 30,
+        interval: TimeInterval = 0.5,
+        allowStoppedAfterStart: Bool = false
+    ) async throws {
         let deadline = Date().addingTimeInterval(timeout)
         let client = ContainerClient()
+        var lastStatus = "not found"
 
         while Date() < deadline {
             try await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
             let container = try? await client.get(id: containerName)
-            if container?.status == .running {
+            guard let container else {
+                lastStatus = "not found"
+                continue
+            }
+            lastStatus = container.status.rawValue
+            if container.status == .running {
                 return
+            }
+            if container.status == .stopped || container.status == .stopping {
+                if allowStoppedAfterStart {
+                    return
+                }
+                throw ComposeError.dependencyNotReady(
+                    "container '\(containerName)' reached status '\(container.status.rawValue)' before running"
+                )
             }
         }
 
-        throw NSError(
-            domain: "ContainerWait", code: 1,
-            userInfo: [
-                NSLocalizedDescriptionKey: "Timed out waiting for container '\(containerName)' to be running."
-            ])
+        throw ComposeError.dependencyNotReady(
+            "timed out waiting for container '\(containerName)' to be running; last status: \(lastStatus)"
+        )
     }
 
-    private func stopOldStuff(_ services: [String], remove: Bool) async throws {
-        guard let projectName else { return }
-        let containers = services.map { "\(projectName)-\($0)" }
+    private func stopOldStuff(_ services: [(serviceName: String, service: Service)], remove: Bool) async throws {
+        guard projectName != nil else { return }
+        let containers = services.map { serviceName, service in
+            containerName(for: serviceName, service: service)
+        }
 
         for container in containers {
             print("Stopping container: \(container)")
@@ -227,6 +304,7 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
                     try await client.delete(id: container.id)
                 } catch {
                     print("Error Removing Container: \(error)")
+                    throw error
                 }
             }
         }
@@ -234,8 +312,8 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
 
     // MARK: Compose Top Level Functions
 
-    private mutating func updateEnvironmentWithServiceIP(_ serviceName: String) async throws {
-        let ip = try await getIPForRunningService(serviceName)
+    private mutating func updateEnvironmentWithServiceIP(_ serviceName: String, containerName: String) async throws {
+        let ip = try await getIPForRunningContainer(containerName)
         self.containerIps[serviceName] = ip
         for (key, value) in environmentVariables.map({ ($0, $1) }) where value == serviceName {
             self.environmentVariables[key] = ip ?? value
@@ -317,8 +395,14 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
     }
 
     // MARK: Compose Service Level Functions
-    private mutating func configService(_ service: Service, serviceName: String, from dockerCompose: DockerCompose) async throws {
-        guard let projectName else { throw ComposeError.invalidProjectName }
+    private mutating func configService(
+        _ service: Service,
+        serviceName: String,
+        from dockerCompose: DockerCompose,
+        readinessRequirement: ComposeServiceReadinessRequirement = .running
+    ) async throws -> Bool {
+        guard projectName != nil else { throw ComposeError.invalidProjectName }
+        let waitForSuccessfulCompletion = readinessRequirement == .completedSuccessfully
 
         var imageToRun: String
         
@@ -352,7 +436,7 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
         }
 
         // Add detach flag if specified on the CLI
-        if detach {
+        if detach && !waitForSuccessfulCompletion {
             runCommandArgs.append("-d")
         }
 
@@ -363,7 +447,7 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
             print("Info: Using explicit container_name: \(containerName)")
         } else {
             // Default container name based on project and service name
-            containerName = "\(projectName)-\(serviceName)"
+            containerName = self.containerName(for: serviceName, service: service)
         }
         runCommandArgs.append("--name")
         runCommandArgs.append(containerName)
@@ -538,26 +622,58 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
             }
         }
 
-        self.containerConsoleColors[serviceName] = serviceColor
+        let assignedServiceColor = serviceColor
+        self.containerConsoleColors[serviceName] = assignedServiceColor
 
-        Task { [self, serviceColor] in
-            @Sendable
-            func handleOutput(_ output: String) {
-                print("\(serviceName): \(output)".applyingColor(serviceColor))
-            }
+        let handleOutput: @Sendable (String) -> Void = { output in
+            print("\(serviceName): \(output)".applyingColor(assignedServiceColor))
+        }
 
+        if waitForSuccessfulCompletion {
             print("\nStarting service: \(serviceName)")
             print("Starting \(serviceName)")
             print("----------------------------------------\n")
-            let _ = try await streamCommand("container", args: ["run"] + runCommandArgs, onStdout: handleOutput, onStderr: handleOutput)
+            let exitCode = try await streamCommand("container", args: ["run"] + runCommandArgs, onStdout: handleOutput, onStderr: handleOutput)
+            guard exitCode == 0 else {
+                throw ComposeError.dependencyNotCompleted("service '\(serviceName)' exited with status \(exitCode)")
+            }
+            return true
         }
 
-        do {
-            try await waitUntilServiceIsRunning(serviceName)
-            try await updateEnvironmentWithServiceIP(serviceName)
-        } catch {
-            print(error)
+        if detach {
+            print("\nStarting service: \(serviceName)")
+            print("Starting \(serviceName)")
+            print("----------------------------------------\n")
+            let exitCode = try await streamCommand("container", args: ["run"] + runCommandArgs, onStdout: handleOutput, onStderr: handleOutput)
+            guard exitCode == 0 else {
+                throw ComposeError.dependencyNotReady("service '\(serviceName)' failed to start with status \(exitCode)")
+            }
+        } else {
+            Task { [self, handleOutput] in
+                do {
+                    print("\nStarting service: \(serviceName)")
+                    print("Starting \(serviceName)")
+                    print("----------------------------------------\n")
+                    let exitCode = try await streamCommand("container", args: ["run"] + runCommandArgs, onStdout: handleOutput, onStderr: handleOutput)
+                    if exitCode != 0 {
+                        handleOutput("container run exited with status \(exitCode)")
+                    }
+                } catch {
+                    handleOutput("container run failed: \(error)")
+                }
+            }
         }
+
+        switch readinessRequirement {
+        case .running:
+            try await waitUntilContainerIsRunning(containerName)
+        case .healthy:
+            try await waitUntilServiceIsHealthy(serviceName, service: service)
+        case .completedSuccessfully:
+            break
+        }
+        try await updateEnvironmentWithServiceIP(serviceName, containerName: containerName)
+        return false
     }
 
     private func pullImage(_ imageName: String, platform: String?) async throws {
@@ -704,6 +820,90 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
         }
 
         return runCommandArgs
+    }
+
+    private func waitForDependencies(
+        of service: Service,
+        in dockerCompose: DockerCompose,
+        completedServices: Set<String>
+    ) async throws {
+        let dependencies = service.dependencyConfigurations ?? [:]
+        for (dependencyName, dependency) in dependencies.sorted(by: { $0.key < $1.key }) {
+            let required = dependency.required ?? true
+            do {
+                switch dependency.condition ?? "service_started" {
+                case "service_started":
+                    try await waitUntilContainerIsRunning(
+                        containerName(for: dependencyName, in: dockerCompose)
+                    )
+                case "service_healthy":
+                    try await waitUntilServiceIsHealthy(dependencyName, in: dockerCompose)
+                case "service_completed_successfully":
+                    guard completedServices.contains(dependencyName) else {
+                        throw ComposeError.dependencyNotCompleted("dependency '\(dependencyName)' has not completed successfully")
+                    }
+                case let condition:
+                    throw ComposeError.unsupportedDependencyCondition("unsupported depends_on condition '\(condition)'")
+                }
+            } catch {
+                if required {
+                    throw error
+                }
+                print("Warning: Optional dependency '\(dependencyName)' was not ready: \(error)")
+            }
+        }
+    }
+
+    private func waitUntilServiceIsHealthy(_ serviceName: String, in dockerCompose: DockerCompose) async throws {
+        guard let service = dockerCompose.services[serviceName] ?? nil,
+              service.healthcheck != nil else {
+            try await waitUntilContainerIsRunning(containerName(for: serviceName, in: dockerCompose))
+            return
+        }
+        try await waitUntilServiceIsHealthy(serviceName, service: service)
+    }
+
+    private func waitUntilServiceIsHealthy(_ serviceName: String, service: Service) async throws {
+        let containerName = containerName(for: serviceName, service: service)
+        try await waitUntilContainerIsRunning(containerName)
+        guard let healthcheck = service.healthcheck else { return }
+        let command = try healthcheck.commandArguments()
+        var lastExitCode: Int32?
+        for _ in 0..<healthcheck.attemptCountIncludingStartPeriod {
+            let exitCode = try await streamCommand(
+                "container",
+                args: ["exec", containerName] + command,
+                onStdout: { _ in },
+                onStderr: { _ in }
+            )
+            if exitCode == 0 {
+                return
+            }
+            lastExitCode = exitCode
+            if let container = try? await ContainerClient().get(id: containerName),
+               container.status != .running {
+                throw ComposeError.dependencyNotHealthy(
+                    "service '\(serviceName)' stopped before becoming healthy"
+                )
+            }
+            try await Task.sleep(nanoseconds: UInt64(healthcheck.intervalSeconds * 1_000_000_000))
+        }
+        let exitDescription = lastExitCode.map { " last healthcheck exit status \($0)." } ?? ""
+        throw ComposeError.dependencyNotHealthy("service '\(serviceName)' did not become healthy.\(exitDescription)")
+    }
+
+    private func containerName(for serviceName: String, in dockerCompose: DockerCompose) throws -> String {
+        guard let service = dockerCompose.services[serviceName] ?? nil else {
+            throw ComposeError.dependencyNotReady("dependency service '\(serviceName)' not found")
+        }
+        return containerName(for: serviceName, service: service)
+    }
+
+    private func containerName(for serviceName: String, service: Service) -> String {
+        if let explicitContainerName = service.container_name {
+            return explicitContainerName
+        }
+        return "\(projectName ?? deriveProjectName(cwd: cwd))-\(serviceName)"
     }
 }
 
