@@ -39,6 +39,9 @@ public enum YamlError: Error, LocalizedError {
 public enum ComposeError: Error, LocalizedError {
     case imageNotFound(String)
     case invalidProjectName
+    case serviceNotFound(String)
+    case unsupportedRuntimeOption(String)
+    case missingEnvFile(String)
 
     public var errorDescription: String? {
         switch self {
@@ -46,6 +49,12 @@ public enum ComposeError: Error, LocalizedError {
             return "Service \(name) must define either 'image' or 'build'."
         case .invalidProjectName:
             return "Could not find project name."
+        case .serviceNotFound(let name):
+            return "service '\(name)' not found"
+        case .unsupportedRuntimeOption(let message):
+            return message
+        case .missingEnvFile(let message):
+            return message
         }
     }
 }

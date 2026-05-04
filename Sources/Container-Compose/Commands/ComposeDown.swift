@@ -25,7 +25,6 @@ import ArgumentParser
 import ContainerCommands
 import ContainerAPIClient
 import Foundation
-import Yams
 
 public struct ComposeDown: AsyncParsableCommand {
     public init() {}
@@ -43,76 +42,41 @@ public struct ComposeDown: AsyncParsableCommand {
 
     private var cwd: String { process.cwd ?? FileManager.default.currentDirectoryPath }
 
-    @Option(name: [.customShort("f"), .customLong("file")], help: "The path to your Docker Compose file")
-    var composeFilename: String?
+    @Option(name: [.customShort("f"), .customLong("file")], parsing: .singleValue, help: "The path to your Docker Compose file")
+    var composeFilenames: [String] = []
 
-    private static let supportedComposeFilenames = [
-        "compose.yml",
-        "compose.yaml",
-        "docker-compose.yml",
-        "docker-compose.yaml",
-    ]
+    @Option(name: .customLong("profile"), parsing: .singleValue, help: "Enable a Compose profile")
+    var profiles: [String] = []
 
-    private var cwdURL: URL {
-        URL(fileURLWithPath: cwd)
-    }
-
-    private var composePath: String {
-        if let composeFilename {
-            return resolvedPath(for: composeFilename, relativeTo: cwdURL)
-        }
-
-        for filename in Self.supportedComposeFilenames {
-            let candidate = cwdURL.appending(path: filename).path
-            if fileManager.fileExists(atPath: candidate) {
-                return candidate
-            }
-        }
-
-        return cwdURL.appending(path: Self.supportedComposeFilenames[0]).path
+    private var composeFiles: ComposeFileSelection {
+        ComposeFileSelection.resolve(explicitFilenames: composeFilenames, cwd: cwd, fileManager: fileManager)
     }
 
     private var fileManager: FileManager { FileManager.default }
     private var projectName: String?
 
     public mutating func run() async throws {
+        let envFiles = process.envFile.isEmpty ? [".env"] : process.envFile
+        let envFilePaths = envFiles.map { resolvedPath(for: $0, relativeTo: URL(fileURLWithPath: cwd)) }
+        let environmentVariables = loadEnvFiles(paths: envFilePaths)
+        let dockerCompose = try composeFiles.load(fileManager: fileManager, environmentVariables: environmentVariables)
 
-        // Read docker-compose.yml content
-        guard let yamlData = fileManager.contents(atPath: composePath) else {
-            let path = URL(fileURLWithPath: composePath)
-                .deletingLastPathComponent()
-                .path
-            throw YamlError.composeFileNotFound(path)
-        }
-
-        // Decode the YAML file into the DockerCompose struct
-        let dockerComposeString = String(data: yamlData, encoding: .utf8)!
-        let dockerCompose = try YAMLDecoder().decode(DockerCompose.self, from: dockerComposeString)
-
-        // Determine project name for container naming
         if let name = dockerCompose.name {
-            projectName = name
-            print("Info: Docker Compose project name parsed as: \(name)")
+            projectName = sanitizeComposeProjectName(name)
+            print("Info: Docker Compose project name parsed as: \(projectName ?? name)")
             print(
-                "Note: The 'name' field currently only affects container naming (e.g., '\(name)-serviceName'). Full project-level isolation for other resources (networks, implicit volumes) is not implemented by this tool."
+                "Note: The 'name' field affects generated container names and project-scoped volume names. Full project-level isolation for networks is not implemented by this tool."
             )
         } else {
             projectName = deriveProjectName(cwd: cwd)
             print("Info: No 'name' field found in docker-compose.yml. Using directory name as project name: \(projectName ?? "")")
         }
 
-        var services: [(serviceName: String, service: Service)] = dockerCompose.services.compactMap({ serviceName, service in
-            guard let service else { return nil }
-            return (serviceName, service)
-        })
-        services = try Service.topoSortConfiguredServices(services)
-
-        // Filter for specified services
-        if !self.services.isEmpty {
-            services = services.filter({ serviceName, service in
-                self.services.contains(where: { $0 == serviceName }) || self.services.contains(where: { service.dependedBy.contains($0) })
-            })
-        }
+        let services = try ComposeServiceSelection.servicesToStopForDown(
+            from: dockerCompose,
+            requestedServices: self.services,
+            activeProfiles: activeComposeProfiles(cliProfiles: profiles)
+        )
 
         try await stopOldStuff(services, remove: false)
     }
@@ -121,7 +85,6 @@ public struct ComposeDown: AsyncParsableCommand {
         guard let projectName else { return }
 
         for (serviceName, service) in services {
-            // Respect explicit container_name, otherwise use default pattern
             let containerName: String
             if let explicitContainerName = service.container_name {
                 containerName = explicitContainerName
@@ -130,9 +93,9 @@ public struct ComposeDown: AsyncParsableCommand {
             }
 
             print("Stopping container: \(containerName)")
-            
+
             let client = ContainerClient()
-            
+
             guard let container = try? await client.get(id: containerName) else {
                 print("Warning: Container '\(containerName)' not found, skipping.")
                 continue

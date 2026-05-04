@@ -13,6 +13,6 @@ struct Application: AsyncParsableCommand {
     @Argument(parsing: .captureForPassthrough) var args: [String]
     
     func run() async throws {
-        await Main.main(args)
+        await Main.main(try normalizeRootComposeOptions(args))
     }
 }

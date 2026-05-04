@@ -29,6 +29,23 @@ struct EnvironmentVariableTests {
         
         #expect(result == "postgres://localhost/mydb")
     }
+
+    @Test("Resolve unbraced variable")
+    func resolveUnbracedVariable() {
+        let envVars = ["APP_REGION": "local", "LOCAL_ENV": "true"]
+
+        #expect(resolveVariable("$APP_REGION", with: envVars) == "local")
+        #expect(resolveVariable("region=$APP_REGION local=$LOCAL_ENV", with: envVars) == "region=local local=true")
+    }
+
+    @Test("Leave invalid unbraced variable references unchanged")
+    func leaveInvalidUnbracedVariableReferencesUnchanged() {
+        let envVars = ["PORT": "8080"]
+
+        #expect(resolveVariable("cost=$$5", with: envVars) == "cost=$5")
+        #expect(resolveVariable("port=$PORT.", with: envVars) == "port=8080.")
+        #expect(resolveVariable("literal=$-suffix", with: envVars) == "literal=$-suffix")
+    }
     
     @Test("Resolve variable with default value when variable exists")
     func resolveVariableWithDefaultWhenExists() {
@@ -46,6 +63,27 @@ struct EnvironmentVariableTests {
         let result = resolveVariable(input, with: envVars)
         
         #expect(result == "3000")
+    }
+
+    @Test("Resolve nested default expression")
+    func resolveNestedDefaultExpression() {
+        let envVars = ["REGISTRY_HOST": "registry.example.com"]
+        let input = "${DATABASE_IMAGE:-${REGISTRY_HOST}/library/postgres:16-alpine}"
+        let result = resolveVariable(input, with: envVars)
+
+        #expect(result == "registry.example.com/library/postgres:16-alpine")
+    }
+
+    @Test("Existing variable overrides nested default expression")
+    func existingVariableOverridesNestedDefaultExpression() {
+        let envVars = [
+            "REGISTRY_HOST": "registry.example.com",
+            "DATABASE_IMAGE": "postgres:custom"
+        ]
+        let input = "${DATABASE_IMAGE:-${REGISTRY_HOST}/library/postgres:16-alpine}"
+        let result = resolveVariable(input, with: envVars)
+
+        #expect(result == "postgres:custom")
     }
     
     @Test("Resolve multiple variables in string")

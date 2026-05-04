@@ -28,7 +28,6 @@ import ContainerAPIClient
 import ContainerizationExtras
 import Foundation
 @preconcurrency import Rainbow
-import Yams
 
 public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
     public init() {}
@@ -46,42 +45,31 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
         help: "Detaches from container logs. Note: If you do NOT detach, killing this process will NOT kill the container. To kill the container, run container-compose down")
     var detach: Bool = false
 
-    @Option(name: [.customShort("f"), .customLong("file")], help: "The path to your Docker Compose file")
-    var composeFilename: String?
+    @Option(name: [.customShort("f"), .customLong("file")], parsing: .singleValue, help: "The path to your Docker Compose file")
+    var composeFilenames: [String] = []
 
-    private static let supportedComposeFilenames = [
-        "compose.yml",
-        "compose.yaml",
-        "docker-compose.yml",
-        "docker-compose.yaml",
-    ]
+    @Option(name: .customLong("profile"), parsing: .singleValue, help: "Enable a Compose profile")
+    var profiles: [String] = []
 
     private var cwdURL: URL {
         URL(fileURLWithPath: cwd)
     }
 
-    private var composePath: String {
-        if let composeFilename {
-            return resolvedPath(for: composeFilename, relativeTo: cwdURL)
-        }
-
-        for filename in Self.supportedComposeFilenames {
-            let candidate = cwdURL.appending(path: filename).path
-            if fileManager.fileExists(atPath: candidate) {
-                return candidate
-            }
-        }
-
-        return cwdURL.appending(path: Self.supportedComposeFilenames[0]).path
+    private var composeFiles: ComposeFileSelection {
+        ComposeFileSelection.resolve(explicitFilenames: composeFilenames, cwd: cwd, fileManager: fileManager)
     }
 
-    private var envFilePath: String {
-        let envFile = process.envFile.first ?? ".env"
-        return resolvedPath(for: envFile, relativeTo: cwdURL)
+    private var composePath: String {
+        composeFiles.primaryPath
+    }
+
+    private var envFilePaths: [String] {
+        let envFiles = process.envFile.isEmpty ? [".env"] : process.envFile
+        return envFiles.map { resolvedPath(for: $0, relativeTo: cwdURL) }
     }
 
     private var composeDirectory: String {
-        URL(fileURLWithPath: composePath).deletingLastPathComponent().path
+        composeFiles.primaryDirectory
     }
 
     @Flag(name: [.customShort("b"), .customLong("build")])
@@ -109,20 +97,8 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
     ]
 
     public mutating func run() async throws {
-        // Read compose.yml content
-        guard let yamlData = fileManager.contents(atPath: composePath) else {
-            let path = URL(fileURLWithPath: composePath)
-                .deletingLastPathComponent()
-                .path
-            throw YamlError.composeFileNotFound(path)
-        }
-
-        // Decode the YAML file into the DockerCompose struct
-        let dockerComposeString = String(data: yamlData, encoding: .utf8)!
-        let dockerCompose = try YAMLDecoder().decode(DockerCompose.self, from: dockerComposeString)
-
-        // Load environment variables from .env file
-        environmentVariables = loadEnvFile(path: envFilePath)
+        environmentVariables = loadEnvFiles(paths: envFilePaths)
+        let dockerCompose = try composeFiles.load(fileManager: fileManager, environmentVariables: environmentVariables)
 
         // Handle 'version' field
         if let version = dockerCompose.version {
@@ -132,29 +108,21 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
 
         // Determine project name for container naming
         if let name = dockerCompose.name {
-            projectName = name
-            print("Info: Docker Compose project name parsed as: \(name)")
+            projectName = sanitizeComposeProjectName(name)
+            print("Info: Docker Compose project name parsed as: \(projectName ?? name)")
             print(
-                "Note: The 'name' field currently only affects container naming (e.g., '\(name)-serviceName'). Full project-level isolation for other resources (networks, implicit volumes) is not implemented by this tool."
+                "Note: The 'name' field affects generated container names and project-scoped volume names. Full project-level isolation for networks is not implemented by this tool."
             )
         } else {
             projectName = deriveProjectName(cwd: cwd)
             print("Info: No 'name' field found in docker-compose.yml. Using directory name as project name: \(projectName ?? "")")
         }
 
-        // Get Services to use
-        var services: [(serviceName: String, service: Service)] = dockerCompose.services.compactMap({ serviceName, service in
-            guard let service else { return nil }
-            return (serviceName, service)
-        })
-        services = try Service.topoSortConfiguredServices(services)
-
-        // Filter for specified services
-        if !self.services.isEmpty {
-            services = services.filter({ serviceName, service in
-                self.services.contains(where: { $0 == serviceName }) || self.services.contains(where: { service.dependedBy.contains($0) })
-            })
-        }
+        let services = try ComposeServiceSelection.selectedServices(
+            from: dockerCompose,
+            requestedServices: self.services,
+            activeProfiles: activeComposeProfiles(cliProfiles: profiles)
+        )
 
         // Stop Services
         try await stopOldStuff(services.map({ $0.serviceName }), remove: true)
@@ -477,7 +445,7 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
                 runCommandArgs.append(networkToConnect)
             }
             print(
-                "Info: Service '\(serviceName)' is configured to connect to networks: \(serviceNetworks.joined(separator: ", ")) ascertained from networks attribute in \(composeFilename)."
+                "Info: Service '\(serviceName)' is configured to connect to networks: \(serviceNetworks.joined(separator: ", ")) ascertained from the Compose file set."
             )
             print(
                 "Note: This tool assumes custom networks are defined at the top-level 'networks' key or are pre-existing. This tool does not create implicit networks for services if not explicitly defined at the top-level."

@@ -36,28 +36,61 @@ public func resolvedPath(for path: String, relativeTo baseURL: URL) -> String {
 /// - Parameter path: The full path to the .env file.
 /// - Returns: A dictionary of key-value pairs representing environment variables.
 public func loadEnvFile(path: String) -> [String: String] {
+    (try? loadEnvFile(path: path, required: false)) ?? [:]
+}
+
+public func loadEnvFile(path: String, required: Bool) throws -> [String: String] {
     var envVars: [String: String] = [:]
     let fileURL = URL(fileURLWithPath: path)
     do {
         let content = try String(contentsOf: fileURL, encoding: .utf8)
-        let lines = content.split(separator: "\n")
+        let lines = content.split(separator: "\n", omittingEmptySubsequences: false)
         for line in lines {
-            let trimmedLine = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            var trimmedLine = line.trimmingCharacters(in: .whitespacesAndNewlines)
             // Ignore empty lines and comments
             if !trimmedLine.isEmpty && !trimmedLine.starts(with: "#") {
+                if trimmedLine.hasPrefix("export ") {
+                    trimmedLine = String(trimmedLine.dropFirst("export ".count)).trimmingCharacters(in: .whitespacesAndNewlines)
+                }
                 // Parse key=value pairs
                 if let eqIndex = trimmedLine.firstIndex(of: "=") {
-                    let key = String(trimmedLine[..<eqIndex])
-                    let value = String(trimmedLine[trimmedLine.index(after: eqIndex)...])
+                    let key = String(trimmedLine[..<eqIndex]).trimmingCharacters(in: .whitespaces)
+                    var value = String(trimmedLine[trimmedLine.index(after: eqIndex)...]).trimmingCharacters(in: .whitespaces)
+                    if value.count >= 2,
+                       let first = value.first,
+                       let last = value.last,
+                       (first == "\"" && last == "\"") || (first == "'" && last == "'") {
+                        value = String(value.dropFirst().dropLast())
+                    }
                     envVars[key] = value
                 }
             }
         }
     } catch {
+        if required {
+            throw ComposeError.missingEnvFile("required env_file '\(path)' could not be read: \(error.localizedDescription)")
+        }
         // print("Warning: Could not read .env file at \(path): \(error.localizedDescription)")
         // Suppress error message if .env file is optional or missing
     }
     return envVars
+}
+
+public func loadEnvFiles(paths: [String]) -> [String: String] {
+    var envVars: [String: String] = [:]
+    for path in paths {
+        envVars.merge(loadEnvFile(path: path)) { _, new in new }
+    }
+    return envVars
+}
+
+public func activeComposeProfiles(cliProfiles: [String]) -> [String] {
+    let environmentProfiles = ProcessInfo.processInfo.environment["COMPOSE_PROFILES"]?
+        .split(separator: ",")
+        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty } ?? []
+    var seen = Set<String>()
+    return (cliProfiles + environmentProfiles).filter { seen.insert($0).inserted }
 }
 
 public func composeShellSplit(_ input: String) -> [String] {
@@ -134,36 +167,154 @@ public func composeShellSplit(_ input: String) -> [String] {
 ///   - envVars: A dictionary of environment variables to use for resolution.
 /// - Returns: The string with all recognized environment variables resolved.
 public func resolveVariable(_ value: String, with envVars: [String: String]) -> String {
-    var resolvedValue = value
-    // Regex to find ${VAR}, ${VAR:-default}, ${VAR:?error}
-    let regex = try! NSRegularExpression(pattern: #"\$\{([A-Za-z0-9_]+)(:?-(.*?))?(:\?(.*?))?\}"#, options: [])
-    
-    // Combine process environment with loaded .env file variables, prioritizing process environment
     let combinedEnv = ProcessInfo.processInfo.environment.merging(envVars) { (current, _) in current }
-    
-    // Loop to resolve all occurrences of variables in the string
-    while let match = regex.firstMatch(in: resolvedValue, options: [], range: NSRange(resolvedValue.startIndex..<resolvedValue.endIndex, in: resolvedValue)) {
-        guard let varNameRange = Range(match.range(at: 1), in: resolvedValue) else { break }
-        let varName = String(resolvedValue[varNameRange])
-        
-        if let envValue = combinedEnv[varName] {
-            // Variable found in environment, replace with its value
-            resolvedValue.replaceSubrange(Range(match.range(at: 0), in: resolvedValue)!, with: envValue)
-        } else if let defaultValueRange = Range(match.range(at: 3), in: resolvedValue) {
-            // Variable not found, but default value is provided, replace with default
-            let defaultValue = String(resolvedValue[defaultValueRange])
-            resolvedValue.replaceSubrange(Range(match.range(at: 0), in: resolvedValue)!, with: defaultValue)
-        } else if match.range(at: 5).location != NSNotFound, let errorMessageRange = Range(match.range(at: 5), in: resolvedValue) {
-            // Variable not found, and error-on-missing syntax used, print error and exit
-            let errorMessage = String(resolvedValue[errorMessageRange])
-            fputs("Error: Missing required environment variable '\(varName)': \(errorMessage)\n", stderr)
-            Application.exit(withError: "Error: Missing required environment variable '\(varName)': \(errorMessage)\n")
+    return resolveVariableReferences(in: value, with: combinedEnv)
+}
+
+private func resolveVariableReferences(in value: String, with envVars: [String: String]) -> String {
+    var resolvedValue = ""
+    var index = value.startIndex
+
+    while index < value.endIndex {
+        guard value[index] == "$" else {
+            resolvedValue.append(value[index])
+            index = value.index(after: index)
+            continue
+        }
+
+        let afterDollar = value.index(after: index)
+        guard afterDollar < value.endIndex else {
+            resolvedValue.append(value[index])
+            index = afterDollar
+            continue
+        }
+
+        if value[afterDollar] == "$" {
+            resolvedValue.append("$")
+            index = value.index(after: afterDollar)
+            continue
+        }
+
+        guard value[afterDollar] == "{" else {
+            guard let nameEnd = unbracedVariableNameEnd(in: value, start: afterDollar),
+                  nameEnd > afterDollar
+            else {
+                resolvedValue.append(value[index])
+                index = afterDollar
+                continue
+            }
+
+            let variableName = String(value[afterDollar..<nameEnd])
+            if let resolvedExpression = resolveComposeExpression(variableName, with: envVars) {
+                resolvedValue.append(resolvedExpression)
+            } else {
+                resolvedValue.append(contentsOf: value[index..<nameEnd])
+            }
+            index = nameEnd
+            continue
+        }
+
+        guard let closingBrace = matchingClosingBrace(in: value, openingBrace: afterDollar) else {
+            resolvedValue.append(value[index])
+            index = afterDollar
+            continue
+        }
+
+        let expressionStart = value.index(after: afterDollar)
+        let expression = String(value[expressionStart..<closingBrace])
+        if let resolvedExpression = resolveComposeExpression(expression, with: envVars) {
+            resolvedValue.append(resolvedExpression)
         } else {
-            // Variable not found and no default/error specified, leave as is and break loop to avoid infinite loop
+            resolvedValue.append(contentsOf: value[index...closingBrace])
+        }
+        index = value.index(after: closingBrace)
+    }
+
+    return resolvedValue
+}
+
+private func unbracedVariableNameEnd(in value: String, start: String.Index) -> String.Index? {
+    var index = start
+    while index < value.endIndex {
+        let character = value[index]
+        guard character.isASCII && (character.isLetter || character.isNumber || character == "_") else {
             break
         }
+        index = value.index(after: index)
     }
-    return resolvedValue
+    return index
+}
+
+private func matchingClosingBrace(in value: String, openingBrace: String.Index) -> String.Index? {
+    var depth = 1
+    var index = value.index(after: openingBrace)
+
+    while index < value.endIndex {
+        if value[index] == "$" {
+            let next = value.index(after: index)
+            if next < value.endIndex, value[next] == "{" {
+                depth += 1
+                index = value.index(after: next)
+                continue
+            }
+        }
+
+        if value[index] == "}" {
+            depth -= 1
+            if depth == 0 {
+                return index
+            }
+        }
+
+        index = value.index(after: index)
+    }
+
+    return nil
+}
+
+private func resolveComposeExpression(_ expression: String, with envVars: [String: String]) -> String? {
+    let nameEnd = expression.firstIndex { character in
+        !(character.isASCII && (character.isLetter || character.isNumber || character == "_"))
+    } ?? expression.endIndex
+    guard nameEnd > expression.startIndex else { return nil }
+
+    let variableName = String(expression[..<nameEnd])
+    let suffix = String(expression[nameEnd...])
+    let envValue = envVars[variableName]
+    let isSet = envValue != nil
+    let isNonEmpty = !(envValue?.isEmpty ?? true)
+
+    if suffix.isEmpty {
+        return envValue
+    }
+
+    if suffix.hasPrefix(":-") {
+        return isNonEmpty ? envValue : resolveVariableReferences(in: String(suffix.dropFirst(2)), with: envVars)
+    }
+
+    if suffix.hasPrefix("-") {
+        return isSet ? envValue : resolveVariableReferences(in: String(suffix.dropFirst()), with: envVars)
+    }
+
+    if suffix.hasPrefix(":?") {
+        if isNonEmpty {
+            return envValue
+        }
+        let errorMessage = resolveVariableReferences(in: String(suffix.dropFirst(2)), with: envVars)
+        fputs("Error: Missing required environment variable '\(variableName)': \(errorMessage)\n", stderr)
+        Application.exit(withError: "Error: Missing required environment variable '\(variableName)': \(errorMessage)\n")
+    }
+
+    if suffix.hasPrefix("?") {
+        if isSet {
+            return envValue
+        }
+        let errorMessage = resolveVariableReferences(in: String(suffix.dropFirst()), with: envVars)
+        fputs("Error: Missing required environment variable '\(variableName)': \(errorMessage)\n", stderr)
+        Application.exit(withError: "Error: Missing required environment variable '\(variableName)': \(errorMessage)\n")
+    }
+
+    return nil
 }
 
 /// Derives a project name from the current working directory. It replaces any '.' characters with
@@ -173,8 +324,14 @@ public func resolveVariable(_ value: String, with envVars: [String: String]) -> 
 /// - Returns: A sanitized project name suitable for container naming.
 public func deriveProjectName(cwd: String) -> String {
     // We need to replace '.' with _ because it is not supported in the container name
-    let projectName = URL(fileURLWithPath: cwd).lastPathComponent.replacingOccurrences(of: ".", with: "_")
-    return projectName
+    sanitizeComposeProjectName(URL(fileURLWithPath: cwd).lastPathComponent)
+}
+
+public func sanitizeComposeProjectName(_ name: String) -> String {
+    let sanitized = String(name.map { character in
+        character.isASCII && (character.isLetter || character.isNumber || character == "-" || character == "_") ? character : "_"
+    })
+    return sanitized.isEmpty ? "default" : sanitized
 }
 
 /// Converts Docker Compose port specification into a container run -p format.

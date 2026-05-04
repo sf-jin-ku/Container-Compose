@@ -26,7 +26,6 @@ import ContainerCommands
 import ContainerAPIClient
 import ContainerizationExtras
 import Foundation
-import Yams
 
 public struct ComposeBuild: AsyncParsableCommand, @unchecked Sendable {
     public init() {}
@@ -39,8 +38,11 @@ public struct ComposeBuild: AsyncParsableCommand, @unchecked Sendable {
     @Argument(help: "Services to build (builds all if omitted)")
     var services: [String] = []
 
-    @Option(name: [.customShort("f"), .customLong("file")], help: "The path to your Docker Compose file")
-    var composeFilename: String?
+    @Option(name: [.customShort("f"), .customLong("file")], parsing: .singleValue, help: "The path to your Docker Compose file")
+    var composeFilenames: [String] = []
+
+    @Option(name: .customLong("profile"), parsing: .singleValue, help: "Enable a Compose profile")
+    var profiles: [String] = []
 
     @Flag(name: .long, help: "Do not use cache when building")
     var noCache: Bool = false
@@ -55,59 +57,44 @@ public struct ComposeBuild: AsyncParsableCommand, @unchecked Sendable {
 
     private var cwdURL: URL { URL(fileURLWithPath: cwd) }
 
-    private static let supportedComposeFilenames = [
-        "compose.yml",
-        "compose.yaml",
-        "docker-compose.yml",
-        "docker-compose.yaml",
-    ]
+    private var fileManager: FileManager { FileManager.default }
+
+    private var composeFiles: ComposeFileSelection {
+        ComposeFileSelection.resolve(explicitFilenames: composeFilenames, cwd: cwd, fileManager: fileManager)
+    }
 
     private var composePath: String {
-        if let composeFilename {
-            return resolvedPath(for: composeFilename, relativeTo: cwdURL)
-        }
-        for filename in Self.supportedComposeFilenames {
-            let candidate = cwdURL.appending(path: filename).path
-            if FileManager.default.fileExists(atPath: candidate) {
-                return candidate
-            }
-        }
-        return cwdURL.appending(path: Self.supportedComposeFilenames[0]).path
+        composeFiles.primaryPath
     }
 
     private var composeDirectory: String {
-        URL(fileURLWithPath: composePath).deletingLastPathComponent().path
+        composeFiles.primaryDirectory
     }
 
-    private var envFilePath: String {
-        let envFile = process.envFile.first ?? ".env"
-        return resolvedPath(for: envFile, relativeTo: cwdURL)
+    private var envFilePaths: [String] {
+        let envFiles = process.envFile.isEmpty ? [".env"] : process.envFile
+        return envFiles.map { resolvedPath(for: $0, relativeTo: cwdURL) }
     }
 
     public mutating func run() async throws {
-        guard let yamlData = FileManager.default.contents(atPath: composePath) else {
-            let dir = URL(fileURLWithPath: composePath).deletingLastPathComponent().path
-            throw YamlError.composeFileNotFound(dir)
-        }
-
-        let dockerComposeString = String(data: yamlData, encoding: .utf8)!
-        let dockerCompose = try YAMLDecoder().decode(DockerCompose.self, from: dockerComposeString)
-        let environmentVariables = loadEnvFile(path: envFilePath)
+        let environmentVariables = loadEnvFiles(paths: envFilePaths)
+        let dockerCompose = try composeFiles.load(fileManager: fileManager, environmentVariables: environmentVariables)
 
         let projectName: String
         if let name = dockerCompose.name {
-            projectName = name
+            projectName = sanitizeComposeProjectName(name)
         } else {
             projectName = deriveProjectName(cwd: cwd)
         }
 
-        var servicesToBuild: [(serviceName: String, service: Service)] = dockerCompose.services.compactMap { name, service in
-            guard let service, service.build != nil else { return nil }
-            return (name, service)
-        }
-
-        if !services.isEmpty {
-            servicesToBuild = servicesToBuild.filter { services.contains($0.serviceName) }
+        let selectedServices = try ComposeServiceSelection.selectedServices(
+            from: dockerCompose,
+            requestedServices: services,
+            activeProfiles: activeComposeProfiles(cliProfiles: profiles),
+            includeDependencies: false
+        )
+        let servicesToBuild = selectedServices.filter { _, service in
+            service.build != nil
         }
 
         if servicesToBuild.isEmpty {

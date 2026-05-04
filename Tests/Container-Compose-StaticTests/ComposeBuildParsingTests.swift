@@ -163,6 +163,67 @@ struct ComposeBuildParsingTests {
     @Test("ComposeBuild command accepts -f flag for compose file")
     func composeBuildCommandAcceptsFileFlag() throws {
         let cmd = try ComposeBuild.parse(["-f", "my-compose.yaml"])
-        #expect(cmd.composeFilename == "my-compose.yaml")
+        #expect(cmd.composeFilenames == ["my-compose.yaml"])
+    }
+
+    @Test("Compose commands accept repeated -f flags")
+    func composeCommandsAcceptRepeatedFileFlags() throws {
+        let build = try ComposeBuild.parse(["-f", "base.yml", "-f", "override.yml"])
+        let up = try ComposeUp.parse(["-f", "base.yml", "-f", "override.yml", "--detach"])
+        let down = try ComposeDown.parse(["-f", "base.yml", "-f", "override.yml"])
+
+        #expect(build.composeFilenames == ["base.yml", "override.yml"])
+        #expect(up.composeFilenames == ["base.yml", "override.yml"])
+        #expect(down.composeFilenames == ["base.yml", "override.yml"])
+    }
+
+    @Test("Compose commands accept repeated profile flags")
+    func composeCommandsAcceptRepeatedProfileFlags() throws {
+        let build = try ComposeBuild.parse(["--profile", "dev", "--profile", "worker"])
+        let up = try ComposeUp.parse(["--profile", "dev", "--profile", "worker", "--detach"])
+        let down = try ComposeDown.parse(["--profile", "dev", "--profile", "worker"])
+
+        #expect(build.profiles == ["dev", "worker"])
+        #expect(up.profiles == ["dev", "worker"])
+        #expect(down.profiles == ["dev", "worker"])
+    }
+
+    @Test("Compose build service selection rejects unknown requested services")
+    func composeBuildServiceSelectionRejectsUnknownRequestedServices() throws {
+        let compose = try YAMLDecoder().decode(DockerCompose.self, from: """
+        services:
+          app:
+            build: .
+        """)
+
+        #expect(throws: ComposeError.self) {
+            try ComposeServiceSelection.selectedServices(
+                from: compose,
+                requestedServices: ["missing"],
+                activeProfiles: [],
+                includeDependencies: false
+            )
+        }
+    }
+
+    @Test("Compose build filters selected services to buildable services")
+    func composeBuildFiltersSelectedServicesToBuildableServices() throws {
+        let compose = try YAMLDecoder().decode(DockerCompose.self, from: """
+        services:
+          app:
+            build: .
+          db:
+            image: postgres:16
+        """)
+
+        let selected = try ComposeServiceSelection.selectedServices(
+            from: compose,
+            requestedServices: [],
+            activeProfiles: [],
+            includeDependencies: false
+        )
+        let buildable = selected.filter { _, service in service.build != nil }.map(\.serviceName)
+
+        #expect(buildable == ["app"])
     }
 }
