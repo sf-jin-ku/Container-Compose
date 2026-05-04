@@ -69,6 +69,38 @@ public struct Network: Codable {
         }
     }
 
+    public func containerNetworkCreateArguments(networkName: String) throws -> [String] {
+        var args: [String] = ["network", "create"]
+        if let driver, !driver.isEmpty, driver != "bridge" {
+            throw ComposeError.unsupportedNetworkOption("network '\(networkName)' uses unsupported driver '\(driver)'")
+        }
+        if let driverOpts = driver_opts, !driverOpts.isEmpty {
+            throw ComposeError.unsupportedNetworkOption("network '\(networkName)' uses unsupported driver_opts")
+        }
+        if attachable == true {
+            throw ComposeError.unsupportedNetworkOption("network '\(networkName)' uses unsupported attachable flag")
+        }
+        if enable_ipv6 == true, ipam?.ipv6Subnet == nil {
+            throw ComposeError.unsupportedNetworkOption("network '\(networkName)' enables IPv6 without an ipam IPv6 subnet")
+        }
+        if isInternal == true {
+            args.append("--internal")
+        }
+        for (key, value) in (labels ?? [:]).sorted(by: { $0.key < $1.key }) {
+            args += ["--label", "\(key)=\(value)"]
+        }
+        if let ipam {
+            try ipam.validateSupportedOptions(networkName: networkName)
+            if let subnet = ipam.ipv4Subnet {
+                args += ["--subnet", subnet]
+            }
+            if let subnet = ipam.ipv6Subnet {
+                args += ["--subnet-v6", subnet]
+            }
+        }
+        args.append(name ?? networkName)
+        return args
+    }
 }
 
 public struct NetworkIPAM: Codable {
@@ -84,6 +116,20 @@ public struct NetworkIPAM: Codable {
         config?.compactMap(\.subnet).first { $0.contains(":") }
     }
 
+    public func validateSupportedOptions(networkName: String) throws {
+        if let driver, !driver.isEmpty, driver != "default" {
+            throw ComposeError.unsupportedNetworkOption("network '\(networkName)' uses unsupported ipam driver '\(driver)'")
+        }
+        if let options, !options.isEmpty {
+            throw ComposeError.unsupportedNetworkOption("network '\(networkName)' uses unsupported ipam options")
+        }
+        let unsupportedConfigs = (config ?? []).contains { item in
+            item.gateway != nil || item.ipRange != nil || !(item.auxAddresses ?? [:]).isEmpty
+        }
+        if unsupportedConfigs {
+            throw ComposeError.unsupportedNetworkOption("network '\(networkName)' uses unsupported ipam gateway/ip_range/aux_addresses")
+        }
+    }
 }
 
 public struct NetworkIPAMConfig: Codable {

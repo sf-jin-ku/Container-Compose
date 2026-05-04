@@ -27,3 +27,39 @@ public struct ServiceNetwork: Codable, Hashable {
         self.ipv4_address = ipv4_address
     }
 }
+
+public extension Service {
+
+
+    func unsupportedAppleContainerRuntimeOptionDescriptions(serviceName: String) -> [String] {
+        var messages = unsupportedAppleContainerNetworkOptionDescriptions(serviceName: serviceName)
+        if let hostname, !hostname.isEmpty {
+            messages.append(
+                "Service '\(serviceName)' requests hostname '\(hostname)', but Apple container currently has no container hostname runtime option."
+            )
+        }
+        return messages
+    }
+
+    func unsupportedAppleContainerNetworkOptionDescriptions(serviceName: String) -> [String] {
+        var messages: [String] = []
+        if let networks, networks.count > 1 {
+            messages.append(
+                "Service '\(serviceName)' requests multiple networks (\(networks.joined(separator: ", "))), but Apple container 0.12.x cannot boot containers attached to more than one network."
+            )
+        }
+        for (networkName, config) in networkConfigurations ?? [:] {
+            if let ipv4Address = config.ipv4_address, !ipv4Address.isEmpty {
+                messages.append(
+                    "Service '\(serviceName)' requests static ipv4_address '\(ipv4Address)' on network '\(networkName)', but Apple container currently has no per-container static IP runtime option."
+                )
+            }
+            if let aliases = config.aliases, !aliases.isEmpty {
+                messages.append(
+                    "Service '\(serviceName)' requests network aliases \(aliases.joined(separator: ", ")) on network '\(networkName)', but Apple container currently has no network alias runtime option."
+                )
+            }
+        }
+        return messages
+    }
+}

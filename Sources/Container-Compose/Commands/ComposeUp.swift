@@ -377,44 +377,7 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
             print("Info: Network '\(networkName)' is declared as external.")
             print("This tool assumes external network '\(externalNetwork.name ?? actualNetworkName)' already exists and will not attempt to create it.")
         } else {
-            var networkCreateArgs: [String] = ["network", "create"]
-
-            #warning("Docker Compose Network Options Not Supported")
-            // Add driver and driver options
-            if let driver = networkConfig?.driver, !driver.isEmpty {
-                //                    networkCreateArgs.append("--driver")
-                //                    networkCreateArgs.append(driver)
-                print("Network Driver Detected, But Not Supported")
-            }
-            if let driverOpts = networkConfig?.driver_opts, !driverOpts.isEmpty {
-                //                    for (optKey, optValue) in driverOpts {
-                //                        networkCreateArgs.append("--opt")
-                //                        networkCreateArgs.append("\(optKey)=\(optValue)")
-                //                    }
-                print("Network Options Detected, But Not Supported")
-            }
-            // Add various network flags
-            if networkConfig?.attachable == true {
-                //                    networkCreateArgs.append("--attachable")
-                print("Network Attachable Flag Detected, But Not Supported")
-            }
-            if networkConfig?.enable_ipv6 == true {
-                //                    networkCreateArgs.append("--ipv6")
-                print("Network IPv6 Flag Detected, But Not Supported")
-            }
-            if networkConfig?.isInternal == true {
-                //                    networkCreateArgs.append("--internal")
-                print("Network Internal Flag Detected, But Not Supported")
-            }  // CORRECTED: Use isInternal
-
-            // Add labels
-            if let labels = networkConfig?.labels, !labels.isEmpty {
-                print("Network Labels Detected, But Not Supported")
-                //                    for (labelKey, labelValue) in labels {
-                //                        networkCreateArgs.append("--label")
-                //                        networkCreateArgs.append("\(labelKey)=\(labelValue)")
-                //                    }
-            }
+            let networkCreateArgs = try networkConfig?.containerNetworkCreateArguments(networkName: networkName) ?? ["network", "create", actualNetworkName]
 
             print("Creating network: \(networkName) (Actual name: \(actualNetworkName))")
             print("Executing container network create: container \(networkCreateArgs.joined(separator: " "))")
@@ -422,7 +385,7 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
                 print("Network '\(networkName)' already exists")
                 return
             }
-            let commands = [actualNetworkName]
+            let commands = Array(networkCreateArgs.dropFirst(2))
             
             let networkCreate = try Application.NetworkCreate.parse(commands + logging.passThroughCommands())
 
@@ -439,6 +402,7 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
         readinessRequirement: ComposeServiceReadinessRequirement = .running
     ) async throws -> Bool {
         guard projectName != nil else { throw ComposeError.invalidProjectName }
+        try validateSupportedRuntimeOptions(service, serviceName: serviceName)
         let waitForSuccessfulCompletion = readinessRequirement == .completedSuccessfully
 
         var imageToRun: String
@@ -581,13 +545,6 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
             print("Note: Service '\(serviceName)' is not explicitly connected to any networks. It will likely use the default bridge network.")
         }
 
-        // Add hostname
-        if let hostname = service.hostname {
-            let resolvedHostname = resolveVariable(hostname, with: environmentVariables)
-            runCommandArgs.append("--hostname")
-            runCommandArgs.append(resolvedHostname)
-        }
-
         // Add working directory
         if let workingDir = service.working_dir {
             let resolvedWorkingDir = resolveVariable(workingDir, with: environmentVariables)
@@ -604,6 +561,7 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
         if service.read_only == true {
             runCommandArgs.append("--read-only")
         }
+        runCommandArgs.append(contentsOf: service.containerRunRuntimeOptionArguments())
 
         // Add resource limits
         if let cpus = service.deploy?.resources?.limits?.cpus {
@@ -816,6 +774,12 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
             return []
         }
         return ["-v", mountArgument]
+    }
+
+    private func validateSupportedRuntimeOptions(_ service: Service, serviceName: String) throws {
+        if let message = service.unsupportedAppleContainerRuntimeOptionDescriptions(serviceName: serviceName).first {
+            throw ComposeError.unsupportedRuntimeOption(message)
+        }
     }
 
     private func waitForDependencies(

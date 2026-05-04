@@ -255,6 +255,15 @@ struct DockerComposeParsingTests {
         #expect(app.ulimits?["nproc"]?.value == "65535")
         #expect(app.initProcess == true)
         #expect(app.security_opt == ["no-new-privileges:true"])
+        #expect(app.containerRunRuntimeOptionArguments() == [
+            "--tmpfs", "/run",
+            "--tmpfs", "/tmp",
+            "--cap-add", "NET_ADMIN",
+            "--cap-drop", "ALL",
+            "--ulimit", "nofile=1024:2048",
+            "--ulimit", "nproc=65535",
+            "--init",
+        ])
     }
     
     @Test("Parse compose with build context")

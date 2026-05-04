@@ -112,6 +112,32 @@ struct NetworkConfigurationTests {
         #expect(redis.networkConfigurations?["netbridge"] == ServiceNetwork())
     }
 
+    @Test("Service network object syntax reports unsupported Apple container options")
+    func serviceNetworkObjectSyntaxReportsUnsupportedAppleContainerOptions() throws {
+        let service = Service(
+            image: "myapp:latest",
+            networks: ["backend", "frontend"],
+            networkConfigurations: [
+                "backend": ServiceNetwork(aliases: ["app.local"], ipv4_address: "10.10.0.5")
+            ]
+        )
+
+        let messages = service.unsupportedAppleContainerNetworkOptionDescriptions(serviceName: "app")
+
+        #expect(messages.contains { $0.contains("multiple networks (backend, frontend)") })
+        #expect(messages.contains { $0.contains("ipv4_address '10.10.0.5'") })
+        #expect(messages.contains { $0.contains("network aliases app.local") })
+    }
+
+    @Test("Service hostname reports unsupported Apple container option")
+    func serviceHostnameReportsUnsupportedAppleContainerOption() throws {
+        let service = Service(image: "confluentinc/cp-kafka:7.9.0", hostname: "kafka-1")
+
+        let messages = service.unsupportedAppleContainerRuntimeOptionDescriptions(serviceName: "kafka-1")
+
+        #expect(messages.contains { $0.contains("hostname 'kafka-1'") })
+    }
+
     @Test("Parse network with driver")
     func parseNetworkWithDriver() throws {
         let yaml = """
@@ -184,6 +210,48 @@ struct NetworkConfigurationTests {
         #expect(network.isInternal == true)
         #expect(network.ipam?.ipv4Subnet == "172.18.0.0/16")
         #expect(network.ipam?.ipv6Subnet == "fd00:abcd::/64")
+    }
+
+    @Test("Map supported network options to Apple container network create arguments")
+    func mapSupportedNetworkOptionsToContainerArguments() throws {
+        let yaml = """
+        driver: bridge
+        internal: true
+        labels:
+          com.example.owner: demo
+        ipam:
+          config:
+            - subnet: 172.20.0.0/16
+        """
+
+        let decoder = YAMLDecoder()
+        let network = try decoder.decode(Network.self, from: yaml)
+
+        #expect(try network.containerNetworkCreateArguments(networkName: "awsbridge") == [
+            "network", "create",
+            "--internal",
+            "--label", "com.example.owner=demo",
+            "--subnet", "172.20.0.0/16",
+            "awsbridge",
+        ])
+    }
+
+    @Test("Fail fast for unsupported top-level network options")
+    func failFastForUnsupportedTopLevelNetworkOptions() throws {
+        let yaml = """
+        attachable: true
+        ipam:
+          config:
+            - subnet: 172.20.0.0/16
+              gateway: 172.20.0.1
+        """
+
+        let decoder = YAMLDecoder()
+        let network = try decoder.decode(Network.self, from: yaml)
+
+        #expect(throws: ComposeError.self) {
+            try network.containerNetworkCreateArguments(networkName: "custom")
+        }
     }
 
     @Test("Multiple networks in compose")

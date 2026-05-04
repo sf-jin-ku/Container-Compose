@@ -50,6 +50,12 @@ struct HelperFunctionsTests {
         #expect(resolvedPath(for: "~/compose.yaml", relativeTo: baseURL) == "\(homePath)/compose.yaml")
     }
 
+    @Test("Compose tmpfs options are reduced to Apple container target path")
+    func testComposeTmpfsOptionsAreReducedToAppleContainerTargetPath() throws {
+        #expect(appleContainerTmpfsTarget(from: "/tmp:mode=1777,uid=1001,gid=0") == "/tmp")
+        #expect(appleContainerTmpfsTarget(from: "/run") == "/run")
+    }
+
     @Test("Compose port - simple container port")
     func testPortSimple() throws {
         let result = composePortToRunArg("3000")

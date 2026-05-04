@@ -40,6 +40,7 @@ public enum ComposeError: Error, LocalizedError {
     case imageNotFound(String)
     case invalidProjectName
     case serviceNotFound(String)
+    case unsupportedNetworkOption(String)
     case unsupportedRuntimeOption(String)
     case unsupportedHealthcheck(String)
     case dependencyNotReady(String)
@@ -57,6 +58,8 @@ public enum ComposeError: Error, LocalizedError {
             return "Could not find project name."
         case .serviceNotFound(let name):
             return "service '\(name)' not found"
+        case .unsupportedNetworkOption(let message):
+            return message
         case .unsupportedRuntimeOption(let message):
             return message
         case .unsupportedHealthcheck(let message):
